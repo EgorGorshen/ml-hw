@@ -87,13 +87,17 @@ class DecisionTree:
         self._min_samples_leaf = min_samples_leaf
 
     def _fit_node(self, sub_X, sub_y, node):
-        if np.all(sub_y != sub_y[0]):
+        if np.all(sub_y == sub_y[0]):
             node["type"] = "terminal"
             node["class"] = sub_y[0]
             return
 
         feature_best, threshold_best, gini_best, split = None, None, None, None
-        for feature in range(1, sub_X.shape[1]):
+        classes = np.unique(sub_y)
+        positive_class = classes[1]
+        encoded_y = (sub_y == positive_class).astype(int)
+
+        for feature in range(sub_X.shape[1]):
             feature_type = self._feature_types[feature]
             categories_map = {}
 
@@ -101,39 +105,35 @@ class DecisionTree:
                 feature_vector = sub_X[:, feature]
             elif feature_type == "categorical":
                 counts = Counter(sub_X[:, feature])
-                clicks = Counter(sub_X[sub_y == 1, feature])
+                positive_counts = Counter(sub_X[sub_y == positive_class, feature])
                 ratio = {}
                 for key, current_count in counts.items():
-                    if key in clicks:
-                        current_click = clicks[key]
-                    else:
-                        current_click = 0
-                    ratio[key] = current_count / current_click
+                    ratio[key] = positive_counts[key] / current_count
                 sorted_categories = list(
-                    map(lambda x: x[1], sorted(ratio.items(), key=lambda x: x[1]))
+                    map(lambda x: x[0], sorted(ratio.items(), key=lambda x: x[1]))
                 )
                 categories_map = dict(
                     zip(sorted_categories, list(range(len(sorted_categories))))
                 )
 
                 feature_vector = np.array(
-                    map(lambda x: categories_map[x], sub_X[:, feature])
+                    list(map(lambda x: categories_map[x], sub_X[:, feature]))
                 )
             else:
                 raise ValueError
 
-            if len(feature_vector) == 3:
+            _, _, threshold, gini = find_best_split(feature_vector, encoded_y)
+            if threshold is None:
                 continue
 
-            _, _, threshold, gini = find_best_split(feature_vector, sub_y)
-            if gini_best is None or gini > gini_best:
+            if gini_best is None or gini < gini_best:
                 feature_best = feature
                 gini_best = gini
                 split = feature_vector < threshold
 
                 if feature_type == "real":
                     threshold_best = threshold
-                elif feature_type == "Categorical":
+                elif feature_type == "categorical":
                     threshold_best = list(
                         map(
                             lambda x: x[0],
@@ -145,7 +145,7 @@ class DecisionTree:
 
         if feature_best is None:
             node["type"] = "terminal"
-            node["class"] = Counter(sub_y).most_common(1)
+            node["class"] = Counter(sub_y).most_common(1)[0][0]
             return
 
         node["type"] = "nonterminal"
@@ -159,11 +159,30 @@ class DecisionTree:
             raise ValueError
         node["left_child"], node["right_child"] = {}, {}
         self._fit_node(sub_X[split], sub_y[split], node["left_child"])
-        self._fit_node(sub_X[np.logical_not(split)], sub_y[split], node["right_child"])
+        self._fit_node(
+            sub_X[np.logical_not(split)],
+            sub_y[np.logical_not(split)],
+            node["right_child"],
+        )
 
     def _predict_node(self, x, node):
-        # ╰( ͡° ͜ʖ ͡° )つ──☆*:・ﾟ
-        pass
+        if node["type"] == "terminal":
+            return node["class"]
+
+        feature = node["feature_split"]
+        feature_type = self._feature_types[feature]
+
+        if feature_type == "real":
+            if x[feature] < node["threshold"]:
+                return self._predict_node(x, node["left_child"])
+            return self._predict_node(x, node["right_child"])
+
+        if feature_type == "categorical":
+            if x[feature] in node["categories_split"]:
+                return self._predict_node(x, node["left_child"])
+            return self._predict_node(x, node["right_child"])
+
+        raise ValueError("There is unknown feature type")
 
     def fit(self, X, y):
         self._fit_node(X, y, self._tree)

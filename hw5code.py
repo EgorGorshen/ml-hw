@@ -20,9 +20,41 @@ def find_best_split(feature_vector, target_vector):
     :return threshold_best: оптимальный порог (число)
     :return gini_best: оптимальное значение критерия Джини (число)
     """
-    # ╰( ͡° ͜ʖ ͡° )つ──☆*:・ﾟ
+    n = len(feature_vector)
+    sorted_idx = np.argsort(feature_vector)
+    feature_sorted = feature_vector[sorted_idx]
+    target_sorted = target_vector[sorted_idx]
+    diff = feature_sorted[1:] != feature_sorted[:-1]
+    split_indices = np.where(diff)[0] + 1
 
-    pass
+    if len(split_indices) == 0:
+        return np.array([]), np.array([]), None, float("inf")
+
+    cumsum = np.cumsum(target_sorted)
+    total_sum = cumsum[-1]
+
+    thresholds = np.zeros(len(split_indices))
+    ginis = np.zeros(len(split_indices))
+
+    for idx, i in enumerate(split_indices):
+        sum_left = cumsum[i - 1]
+        sum_right = total_sum - sum_left
+        p1_left = sum_left / i
+        p1_right = sum_right / (n - i)
+
+        gini_l = 2 * p1_left * (1 - p1_left)
+        gini_r = 2 * p1_right * (1 - p1_right)
+
+        ginis[idx] = (i / n) * gini_l + ((n - i) / n) * gini_r
+        thresholds[idx] = (feature_sorted[i - 1] + feature_sorted[i]) / 2.0
+
+    min_gini = np.min(ginis)
+    best_indices = np.where(ginis == min_gini)[0]
+    best_idx = best_indices[np.argmin(thresholds[best_indices])]
+    threshold_best = thresholds[best_idx]
+    gini_best = ginis[best_idx]
+
+    return thresholds, ginis, threshold_best, gini_best
 
 
 class DecisionTree:
@@ -35,8 +67,17 @@ class DecisionTree:
     ВНИМАНИЕ: в методе _fit_node ниже могут быть намеренно оставлены некоторые ошибки.
     Их нужно исправить в рамках задания.
     """
-    def __init__(self, feature_types, max_depth=None, min_samples_split=None, min_samples_leaf=None):
-        if np.any(list(map(lambda x: x != "real" and x != "categorical", feature_types))):
+
+    def __init__(
+        self,
+        feature_types,
+        max_depth=None,
+        min_samples_split=None,
+        min_samples_leaf=None,
+    ):
+        if np.any(
+            list(map(lambda x: x != "real" and x != "categorical", feature_types))
+        ):
             raise ValueError("There is unknown feature type")
 
         self._tree = {}
@@ -60,7 +101,7 @@ class DecisionTree:
                 feature_vector = sub_X[:, feature]
             elif feature_type == "categorical":
                 counts = Counter(sub_X[:, feature])
-                clicks = Counter(sub_X[sub_y == 1, feature]) 
+                clicks = Counter(sub_X[sub_y == 1, feature])
                 ratio = {}
                 for key, current_count in counts.items():
                     if key in clicks:
@@ -68,10 +109,16 @@ class DecisionTree:
                     else:
                         current_click = 0
                     ratio[key] = current_count / current_click
-                sorted_categories = list(map(lambda x: x[1], sorted(ratio.items(), key=lambda x: x[1])))
-                categories_map = dict(zip(sorted_categories, list(range(len(sorted_categories)))))
+                sorted_categories = list(
+                    map(lambda x: x[1], sorted(ratio.items(), key=lambda x: x[1]))
+                )
+                categories_map = dict(
+                    zip(sorted_categories, list(range(len(sorted_categories))))
+                )
 
-                feature_vector = np.array(map(lambda x: categories_map[x], sub_X[:, feature]))
+                feature_vector = np.array(
+                    map(lambda x: categories_map[x], sub_X[:, feature])
+                )
             else:
                 raise ValueError
 
@@ -87,8 +134,12 @@ class DecisionTree:
                 if feature_type == "real":
                     threshold_best = threshold
                 elif feature_type == "Categorical":
-                    threshold_best = list(map(lambda x: x[0],
-                                              filter(lambda x: x[1] < threshold, categories_map.items())))
+                    threshold_best = list(
+                        map(
+                            lambda x: x[0],
+                            filter(lambda x: x[1] < threshold, categories_map.items()),
+                        )
+                    )
                 else:
                     raise ValueError
 

@@ -86,16 +86,32 @@ class DecisionTree:
         self._min_samples_split = min_samples_split
         self._min_samples_leaf = min_samples_leaf
 
-    def _fit_node(self, sub_X, sub_y, node):
+    def _make_terminal_node(self, sub_y, node):
+        node["type"] = "terminal"
+        node["class"] = Counter(sub_y).most_common(1)[0][0]
+
+    def _fit_node(self, sub_X, sub_y, node, depth=0):
         if np.all(sub_y == sub_y[0]):
             node["type"] = "terminal"
             node["class"] = sub_y[0]
+            return
+        if self._max_depth is not None and depth >= self._max_depth:
+            self._make_terminal_node(sub_y, node)
+            return
+        if (
+            self._min_samples_split is not None
+            and len(sub_y) < self._min_samples_split
+        ):
+            self._make_terminal_node(sub_y, node)
             return
 
         feature_best, threshold_best, gini_best, split = None, None, None, None
         classes = np.unique(sub_y)
         positive_class = classes[1]
         encoded_y = (sub_y == positive_class).astype(int)
+        min_samples_leaf = (
+            1 if self._min_samples_leaf is None else self._min_samples_leaf
+        )
 
         for feature in range(sub_X.shape[1]):
             feature_type = self._feature_types[feature]
@@ -122,9 +138,28 @@ class DecisionTree:
             else:
                 raise ValueError
 
-            _, _, threshold, gini = find_best_split(feature_vector, encoded_y)
-            if threshold is None:
+            thresholds, ginis, _, _ = find_best_split(feature_vector, encoded_y)
+            if len(thresholds) == 0:
                 continue
+
+            valid_thresholds = []
+            valid_ginis = []
+            for threshold, gini in zip(thresholds, ginis):
+                current_split = feature_vector < threshold
+                l_size = np.sum(current_split)
+                r_size = len(sub_y) - l_size
+                if l_size >= min_samples_leaf and r_size >= min_samples_leaf:
+                    valid_thresholds.append(threshold)
+                    valid_ginis.append(gini)
+
+            if len(valid_thresholds) == 0:
+                continue
+
+            valid_thresholds = np.array(valid_thresholds)
+            valid_ginis = np.array(valid_ginis)
+            min_gini = np.min(valid_ginis)
+            threshold = np.min(valid_thresholds[valid_ginis == min_gini])
+            gini = min_gini
 
             if gini_best is None or gini < gini_best:
                 feature_best = feature
@@ -144,8 +179,7 @@ class DecisionTree:
                     raise ValueError
 
         if feature_best is None:
-            node["type"] = "terminal"
-            node["class"] = Counter(sub_y).most_common(1)[0][0]
+            self._make_terminal_node(sub_y, node)
             return
 
         node["type"] = "nonterminal"
@@ -158,11 +192,12 @@ class DecisionTree:
         else:
             raise ValueError
         node["left_child"], node["right_child"] = {}, {}
-        self._fit_node(sub_X[split], sub_y[split], node["left_child"])
+        self._fit_node(sub_X[split], sub_y[split], node["left_child"], depth + 1)
         self._fit_node(
             sub_X[np.logical_not(split)],
             sub_y[np.logical_not(split)],
             node["right_child"],
+            depth + 1,
         )
 
     def _predict_node(self, x, node):
@@ -185,7 +220,7 @@ class DecisionTree:
         raise ValueError("There is unknown feature type")
 
     def fit(self, X, y):
-        self._fit_node(X, y, self._tree)
+        self._fit_node(X, y, self._tree, depth=0)
 
     def predict(self, X):
         predicted = []

@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
-
+import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.metrics import roc_auc_score
-
+from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
-
+from pathlib import Path
 from sklearn.base import ClassifierMixin
+
+# note: да я знаю что такое literal и named tuple
+from typing import Literal, NamedTuple
+
+# TODO: можно попробовать сделать функцию для вычисления метрик которая будет считать сразу все
+
+type Metrix = Literal["val_loss", "train_loss", "val_roc_auc", "train_roc_auc"]
+
+
+class BestIteration(NamedTuple):
+    step: int
+    score: float
 
 
 class BoostingClassifier(ClassifierMixin):
@@ -20,9 +33,18 @@ class BoostingClassifier(ClassifierMixin):
         learning_rate: float = 0.05,
         random_state: int | None = 42,
         verbose: bool = True,
-        time_series: bool = False,
+        early_stopping_rounds: int | None = 0,
+        eval_metric: Metrix | None = None,
+        val_size: float | None = 0.1,
+        use_best_model: bool = False,
+        eval_set: tuple[np.ndarray, np.ndarray] | None = None,
+        commit_to: Path | str | None = None,
+        commit_step: int | None = None,
     ):
         super().__init__()
+
+        self.commit_to = commit_to
+        self.commit_step = commit_step
 
         self.base_model_class = base_model_class
         self.base_model_params = {} if base_model_params is None else base_model_params
@@ -31,13 +53,17 @@ class BoostingClassifier(ClassifierMixin):
         self.learning_rate = learning_rate
 
         self.models = [0] * (n_estimators)
-        self.gammas = [0] * (n_estimators)
+        self.gammas = [0.0] * (n_estimators)
 
-        self.random_state = (
-            random_state  # не забудьте вставить его везде, где у вас возникает рандом
-        )
+        self.random_state = random_state
+        self.best = BestIteration(step=0, score=-np.inf)
+        self.eval_set = eval_set
+
+        self.early_stopping_rounds = early_stopping_rounds
         self.verbose = verbose
-        self.time_series = time_series
+        self.val_size = val_size
+        self.eval_metric = eval_metric
+        self.use_best_model = use_best_model
 
         self.history = defaultdict(list)  # {"train_roc_auc": [], "train_loss": [], ...}
 
@@ -49,7 +75,8 @@ class BoostingClassifier(ClassifierMixin):
         self, X: np.ndarray, y: np.ndarray, step: int, train_predictions: np.ndarray
     ) -> None:
         base_model = self.base_model_class(**self.base_model_params)
-        base_model.fit(X, y)
+        anti_gradient = self.unti_grad_fn(y, train_predictions)
+        base_model.fit(X, anti_gradient)
         new_predictions = base_model.predict(X)
         self.models[step] = base_model
         self.gammas[step] = self._find_optimal_gamma(
@@ -57,26 +84,155 @@ class BoostingClassifier(ClassifierMixin):
         )
         train_predictions += self.learning_rate * self.gammas[step] * new_predictions
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> None:
+    def _split_val(self, X_train, y_train):
+        if self.eval_set:
+            X_val, y_val = self.eval_set
+        else:
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_train,
+                y_train,
+                test_size=self.val_size,
+                random_state=self.random_state,
+            )
+        return X_train, X_val, y_train, y_val
+
+    @property
+    def __early_stopping_on(self) -> bool:
+        if self.early_stopping_rounds is None:
+            return False
+
+        if self.eval_set is None:
+            raise ValueError("ERROR: валидационная выборка не задана")
+
+        if self.eval_metric is None:
+            logging.warning(
+                "укажите метрику останова! Поставил её дефолтной: `val_loss`"
+            )
+            self.eval_metric = "val_loss"
+
+        return True
+
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+    ) -> None:
+        if self.__early_stopping_on:
+            val_predictions = np.zeros(self.eval_set[0].shape[0])
+
         train_predictions = np.zeros(X_train.shape[0])
-        self.classes_ = np.unique(
-            y_train
-        )  # не рекомендуется убирать, нужно для калибровки
+
+        self.classes_ = np.unique(y_train)
         estimator_range = range(self.n_estimators)
         if self.verbose:
             estimator_range = tqdm(estimator_range)
 
         for i in estimator_range:
             self.partial_fit(X_train, y_train, i, train_predictions)
-            sigmoid = self.sigmoid(train_predictions)
-            self.history["train_loss"].append(self.loss_fn(y_train, sigmoid))
-            self.history["train_roc-auc"].append(
-                roc_auc_score(y_true=(y_train == 1), y_score=sigmoid)
-            )
+            self._record_metrics("train", y_train, train_predictions)
+            if self.__early_stopping_on and self._early_stopping(
+                i, X_val, y_val, val_predictions
+            ):
+                break
 
         # чтобы было удобнее смотреть
         for key in self.history:
             self.history[key] = np.array(self.history[key])
+
+    def _record_metrics(
+        self, prefix: Literal["train", "val"], y: np.ndarray, predictions: np.ndarray
+    ) -> None:
+        proba = self.sigmoid(predictions)
+        self.history[f"{prefix}_loss"].append(self.loss_fn(y, predictions))
+        self.history[f"{prefix}_roc_auc"].append(
+            roc_auc_score(y == 1, proba) if np.unique(y).size > 1 else np.nan
+        )
+
+    # NOTE: chat-gpt когда оптимизировал код
+    def _is_better(self, metric: str, score: float) -> bool:
+        if not np.isfinite(score):
+            return False
+        if len(self.history[metric]) == 1:
+            return True
+        if metric.endswith("roc_auc"):
+            return score > self.best.score
+        return score < self.best.score
+
+    def _early_stopping(
+        self,
+        step: int,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        val_predictions: np.ndarray,
+    ) -> bool:
+        val_predictions += (
+            self.learning_rate * self.gammas[step] * self.models[step].predict(X_val)
+        )
+
+        self._record_metrics("val", y_val, val_predictions)
+        metric = self.eval_metric or "val_loss"
+        score = self.history[metric][-1]
+
+        if self._is_better(metric, score):
+            self.best = BestIteration(step=step, score=score)
+
+        if (
+            self.early_stopping_rounds
+            and self.early_stopping_rounds <= step - self.best.step
+            and self.use_best_model
+        ):
+            self.models = self.models[: self.best.step + 1]
+            self.gammas = self.gammas[: self.best.step + 1]
+            return True
+
+        return False
+
+    # NOTE: chat-pgt
+    def plot_history(self, keys: Metrix | list[Metrix]) -> None:
+        if isinstance(keys, str):
+            keys = [keys]
+
+        plt.style.use("seaborn-v0_8-whitegrid")
+        fig, ax = plt.subplots(figsize=(10, 5), dpi=120)
+
+        for key in keys:
+            values = np.asarray(self.history[key])
+            if values.size == 0:
+                continue
+
+            steps = np.arange(1, values.size + 1)
+            ax.plot(
+                steps,
+                values,
+                linewidth=2.4,
+                marker="o",
+                markersize=3.5,
+                label=key,
+            )
+
+            if np.all(np.isnan(values)):
+                continue
+
+            best_idx = (
+                np.nanargmax(values)
+                if key.endswith("roc_auc")
+                else np.nanargmin(values)
+            )
+            ax.scatter(
+                steps[best_idx],
+                values[best_idx],
+                s=70,
+                zorder=3,
+                edgecolor="white",
+                linewidth=1.2,
+            )
+
+        ax.set_title("Boosting metrics history", fontsize=14, fontweight="bold")
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Metric value")
+        ax.legend(frameon=True)
+        ax.spines[["top", "right"]].set_visible(False)
+        fig.tight_layout()
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         res = self.sigmoid(
@@ -88,11 +244,10 @@ class BoostingClassifier(ClassifierMixin):
     def _find_optimal_gamma(
         self, y: np.ndarray, old_predictions: np.ndarray, new_predictions: np.ndarray
     ) -> float:
-        gammas = np.linspace(start=0, stop=1, num=100)
-        losses = [
-            self.loss_fn(y, old_predictions + gamma * new_predictions)
-            for gamma in gammas
-        ]
+        # NOTE: ускорил chat-gpt
+        gammas = np.linspace(0, 1, 100)
+        z = old_predictions[None, :] + gammas[:, None] * new_predictions[None, :]
+        losses = -np.log(self.sigmoid(y[None, :] * z)).mean(axis=1)
         return gammas[np.argmin(losses)]
 
     def score(self, X: np.ndarray, y: np.ndarray) -> float:

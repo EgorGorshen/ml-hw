@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as pl
 import numpy as np
+import json
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -38,16 +39,13 @@ class BoostingClassifier(ClassifierMixin):
         val_size: float | None = 0.1,
         use_best_model: bool = False,
         eval_set: tuple[np.ndarray, np.ndarray] | None = None,
-        commit_to: Path | str | None = None,
-        commit_step: int | None = None,
+        history_commit_path: Path | None = None,
     ):
         super().__init__()
-
-        self.commit_to = commit_to
-        self.commit_step = commit_step
-
         self.base_model_class = base_model_class
         self.base_model_params = {} if base_model_params is None else base_model_params
+
+        self.history_commit_path = history_commit_path
 
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
@@ -130,14 +128,40 @@ class BoostingClassifier(ClassifierMixin):
         for i in estimator_range:
             self.partial_fit(X_train, y_train, i, train_predictions)
             self._record_metrics("train", y_train, train_predictions)
-            if self.__early_stopping_on and self._early_stopping(
-                i, X_val, y_val, val_predictions
-            ):
+            if self.__early_stopping_on and self._early_stopping(i, val_predictions):
                 break
+
+        self.commit_history()
 
         # чтобы было удобнее смотреть
         for key in self.history:
-            self.history[key] = np.array(self.history[key])
+            self.history[key] = np.array(self.history[key])  # type: ignore
+
+    def commit_history(self, path: Path | None = None):
+        if self.history_commit_path is None and path is None:
+            return
+
+        if path is None:
+            path = self.history_commit_path
+
+        if not path.exists():
+            path.touch()
+
+        if not path.is_file():
+            raise FileNotFoundError("Путь не является файлом")
+
+        # [{histpry}]
+        with open(path, "r", encoding="utf-8") as file:
+            res = json.load(file)
+
+        if res is None:
+            res = []
+
+        if not isinstance(res, list):
+            raise TypeError("В JSON должен быть список словарей")
+
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(res, file, ensure_ascii=False, indent=4)
 
     def _record_metrics(
         self, prefix: Literal["train", "val"], y: np.ndarray, predictions: np.ndarray
@@ -161,10 +185,9 @@ class BoostingClassifier(ClassifierMixin):
     def _early_stopping(
         self,
         step: int,
-        X_val: np.ndarray,
-        y_val: np.ndarray,
         val_predictions: np.ndarray,
     ) -> bool:
+        X_val, y_val = self.eval_set
         val_predictions += (
             self.learning_rate * self.gammas[step] * self.models[step].predict(X_val)
         )
@@ -237,7 +260,7 @@ class BoostingClassifier(ClassifierMixin):
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         res = self.sigmoid(
             self.learning_rate
-            * sum(g * model.predict(X) for (g, model) in zip(self.gammas, self.models))
+            * sum(g * model.predict(X) for (g, model) in zip(self.gammas, self.models))  # type: ignore
         )
         return np.vstack([1 - res, res]).T
 
@@ -250,5 +273,5 @@ class BoostingClassifier(ClassifierMixin):
         losses = -np.log(self.sigmoid(y[None, :] * z)).mean(axis=1)
         return gammas[np.argmin(losses)]
 
-    def score(self, X: np.ndarray, y: np.ndarray) -> float:
-        return roc_auc_score(y == 1, self.predict_proba(X)[:, 1])
+    def score(self, X: np.ndarray, y: np.ndarray) -> float:  # type: ignore
+        return roc_auc_score(y == 1, self.predict_proba(X)[:, 1])  # type: ignore
